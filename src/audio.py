@@ -78,6 +78,47 @@ def reproducir(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> None:
     sd.wait()
 
 
+SAMPLE_RATE_BLIP = 44_100  # estándar universal de reproducción; no tiene que
+# ver con SAMPLE_RATE (16kHz), que es un requisito de Whisper para GRABAR voz,
+# no de los dispositivos de salida para REPRODUCIR. Un dispositivo WASAPI de
+# este equipo rechazó 16kHz para reproducción ("Invalid sample rate").
+
+
+def generar_blip(frecuencia: float = 880.0, duracion: float = 0.15) -> np.ndarray:
+    """Genera un pitido corto (seno) para confirmar que el despertador escuchó.
+
+    No usamos un archivo de audio externo: un seno generado con numpy pesa
+    cero bytes en disco y es instantáneo. Se aplica un fundido de entrada y
+    salida (fade in/out) de unos milisegundos para evitar el "click" que se
+    escucha si el sonido empieza o termina de golpe en amplitud distinta de 0.
+    """
+    n_muestras = int(duracion * SAMPLE_RATE_BLIP)
+    t = np.linspace(0, duracion, n_muestras, endpoint=False)
+    onda = np.sin(2 * np.pi * frecuencia * t).astype(np.float32)
+
+    n_fundido = max(1, int(0.01 * SAMPLE_RATE_BLIP))  # 10ms de fundido
+    fundido = np.linspace(0, 1, n_fundido, dtype=np.float32)
+    onda[:n_fundido] *= fundido
+    onda[-n_fundido:] *= fundido[::-1]
+
+    return onda * 0.3  # volumen moderado, no al máximo
+
+
+# En Windows, el mezclador añade ~0.2-0.5s de latencia entre que PortAudio
+# "entrega" el audio y que suena de verdad. sd.wait() retorna al terminar la
+# entrega (no la reproducción), y al cerrarse el stream se descarta lo que
+# quedaba en cola: un clip de 0.15s se perdía ENTERO. El relleno de silencio
+# al final hace de cola sacrificable para que el tono sí llegue al hardware.
+RELLENO_BLIP = 0.5  # segundos de silencio tras el tono
+
+
+def reproducir_blip() -> None:
+    """Reproduce el pitido corto de confirmación."""
+    blip = generar_blip()
+    silencio = np.zeros(int(RELLENO_BLIP * SAMPLE_RATE_BLIP), dtype=np.float32)
+    reproducir(np.concatenate([blip, silencio]), sample_rate=SAMPLE_RATE_BLIP)
+
+
 def guardar_wav(audio: np.ndarray, ruta: str, sample_rate: int = SAMPLE_RATE) -> None:
     """Guarda el audio como .wav de 16 bits (formato estándar).
 

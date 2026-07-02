@@ -179,6 +179,66 @@
 - 2026-07-02: Plan de las fases A/B/C (v2–v4) definido y aprobado (ver sección siguiente).
   Decisiones del usuario: motor de wake word = **openWakeWord** (gratis, sin cuenta);
   Fase B incluye los 4 grupos de herramientas (apps/webs, timers, sistema, búsqueda e info).
+- 2026-07-02: Riesgo de instalación (Fase A) descartado: `openwakeword` y `onnxruntime`
+  instalan sin problemas en Python 3.13 (`pip install --dry-run`). Para el VAD se evitó el
+  paquete `silero-vad` de PyPI porque arrastra `torch` (~600MB) como dependencia dura;
+  en su lugar se usa `openwakeword.vad.VAD`, que ya trae el mismo modelo Silero VAD en
+  formato ONNX puro (se descarga junto con el modelo de wake word, sin pasos extra).
+- 2026-07-02: Módulo 1 (`despertador.py` + `test_despertador.py`) CERRADO. Modelo
+  preentrenado usado: `hey_jarvis` (únicas palabras disponibles sin entrenar un modelo
+  propio: `alexa, hey_mycroft, hey_jarvis, hey_rhasspy, timer, weather`; entrenar una
+  palabra custom con TTS sintético queda anotado como posible trabajo futuro, no pedido
+  aún). Calibración de `UMBRAL_DETECCION` con el micrófono real del usuario: con 0.5 casi
+  ninguna detección correcta cruzaba el umbral (scores 0.15–0.47); con 0.35 tampoco
+  mejoró demasiado; bajando a **0.1** detecta de forma consistente y, en una prueba de
+  varios minutos con TV/música de fondo, no hubo falsos positivos. Valor final:
+  `UMBRAL_DETECCION = 0.1`.
+- 2026-07-02: Módulo 2 (`vad.py` + `test_vad.py`) CERRADO. Reutiliza el Silero VAD ya
+  descargado por `despertador.py`. Prueba con voz real: corta sola ~1s después del
+  silencio y la transcripción con Whisper no perdió palabras del final. Parámetros por
+  defecto sin cambios: `UMBRAL_VOZ=0.5`, `SILENCIO_PARA_CORTAR=1.0s`,
+  `DURACION_MAXIMA=15.0s`.
+- 2026-07-02: Módulo 3 (sonido de confirmación / "blip" en `audio.py`) RESUELTO (mismo
+  día, ver causa raíz al final de esta entrada). Historial del diagnóstico:
+  `audio.generar_blip()` + `audio.reproducir_blip()` están implementados (tono seno con
+  fade in/out, sin archivos externos) pero **no se escucha nada** en el equipo del
+  usuario, sin ninguna excepción. Diagnóstico y descartes, en orden:
+  1. Primer intento reproducía a 16kHz (la frecuencia de Whisper para GRABAR, sin motivo
+     para aplicarla a REPRODUCIR un tono). Dispositivo MME por defecto ("Google TV",
+     índice 3 en `sd.query_devices()`) lo aceptó sin error pero no sonó.
+  2. Se forzó el dispositivo de altavoces por índice (`sd.default.device = (None, 4)`,
+     MME "Altavoces (Realtek(R) Audio)") a 16kHz: tampoco sonó, sin error.
+  3. Se forzó el dispositivo WASAPI de altavoces (índice 10) a 16kHz: **error explícito**
+     `sounddevice.PortAudioError: Invalid sample rate [PaErrorCode -9997]` — confirma que
+     16kHz no es válido para reproducción en ese dispositivo/driver.
+  4. Se cambió el blip a reproducirse a 44100 Hz (estándar universal), sin forzar
+     dispositivo (usa el default del sistema): sigue sin escucharse, sin error.
+  - Dato importante: la voz de Piper (`tts.py`, reproduce a ~22050 Hz por el default del
+    sistema) **sí se escucha** en este mismo equipo (confirmado en la v1). Es decir, la
+    salida de audio en general funciona; el problema es específico del blip generado con
+    numpy/sounddevice de forma standalone.
+  - Hipótesis no probadas todavía: (a) el volumen del tono (`* 0.3`) o la duración
+    (0.15s) son demasiado bajos/cortos para notarse aunque sí esté sonando; (b) mezclador
+    de volumen de Windows por app silenciando este proceso de Python específico entre
+    llamadas; (c) alguna diferencia entre cómo Piper/`sd.play` deja el stream abierto vs.
+    cómo lo abre `audio.reproducir()` en una llamada aislada de una línea (`python -c`).
+  - Lista completa de dispositivos de salida disponibles (`sd.query_devices()`), por si
+    hace falta probar otro índice: 2 (Asignador Microsoft), 3 (Google TV, default MME),
+    4 (Altavoces Realtek, MME), 7 (Asignador Microsoft, DirectSound), 8 (Google TV,
+    DirectSound), 9 (Altavoces Realtek, DirectSound), 10 (Altavoces Realtek, WASAPI — no
+    acepta 16kHz), 11 (Google TV, WASAPI), 13/20/21/22 (variantes WDM-KS de altavoces),
+    26 (Output NVIDIA, WDM-KS).
+  - **CAUSA RAÍZ (confirmada con prueba A/B escuchada por el usuario):** en Windows, el
+    mezclador añade ~0.2-0.5s de latencia entre que PortAudio "entrega" las muestras al
+    driver y que suenan de verdad. `sd.wait()` retorna al terminar la ENTREGA, no la
+    reproducción; al retornar, el stream se cierra y descarta lo que quedaba en cola.
+    Con la voz de Piper (varios segundos, mismo `sd.play` y mismo dispositivo default)
+    solo se pierde una cola inaudible; con un clip de 0.15s se perdía el clip ENTERO.
+    Por eso nunca hubo error: el audio sí se "reproducía", pero jamás llegaba al hardware.
+  - **ARREGLO:** `reproducir_blip()` añade `RELLENO_BLIP = 0.5` s de silencio tras el
+    tono — el silencio hace de cola sacrificable y el tono sí alcanza a sonar. Verificado
+    en el equipo del usuario. Hipótesis descartadas: volumen/duración insuficientes,
+    mezclador por app, dispositivo default (Piper suena por el mismo "Google TV").
 
 ---
 
@@ -223,16 +283,37 @@ Porcupine (requiere cuenta Picovoice).
      y lo transcribe con la Capa 2 para confirmar que no recorta palabras.
 3. **`src/audio.py`** (ampliar, no romper) — sonido corto de confirmación ("blip" generado
    con numpy, sin archivos externos). `grabar_push_to_talk()` se conserva intacto como respaldo.
-4. **`src/asistente.py`** (adaptar) — nuevo loop manos libres; flag `--teclado` para arrancar
-   en modo push-to-talk clásico. La cadena STT→LLM→TTS no se toca.
-   - *Prueba de integración:* conversación completa sin tocar el teclado, varios turnos;
-     verificar que mientras el asistente habla no se dispara a sí mismo (pausar el
-     despertador durante el TTS).
+4. **`src/asistente.py`** (adaptado, 2026-07-02) — nuevo loop manos libres por defecto:
+   `Despertador.escuchar()` → `audio.reproducir_blip()` → abre una **sesión**: repite
+   `EscuchaConVAD.grabar()` → transcribir → responder → hablar mientras el usuario
+   no se despida, SIN repetir "Hey Jarvis" entre turnos. Al despedirse ("adiós", etc.)
+   la sesión termina y el programa vuelve a esperar la palabra de activación (no
+   termina el programa); Ctrl+C es la única forma de cerrar el programa. Flag
+   `--teclado` conserva intacto el modo push-to-talk clásico (ahí sí, despedirse
+   termina el programa, porque no existe el concepto de "sesión": cada Enter ya es
+   una activación manual explícita). La cadena STT→LLM→TTS no se tocó; se extrajo a
+   `procesar_turno()` y la comparten ambos modos.
+   - Auto-despertarse resuelto por diseño, no con un "pausado" explícito: el loop es
+     secuencial (sin hilos), así que `despertador.escuchar()` solo vuelve a llamarse
+     DESPUÉS de que `voz.decir()` ya terminó de reproducirse. Mientras el asistente
+     habla, nada está leyendo el micrófono para la palabra de activación.
+   - No hace falta limpiar estado extra entre sesiones: `despertador.escuchar()` ya
+     llama `self.model.reset()` y `escucha.grabar()` ya llama `self.vad.reset_states()`
+     al principio de cada llamada.
+   - *Prueba de integración:* CONFIRMADA por el usuario (2026-07-02) hablando en vivo —
+     varios turnos seguidos tras un solo "Hey Jarvis" sin repetirlo; "adiós" corta la
+     sesión sin cerrar el programa; "Hey Jarvis" de nuevo abre una sesión nueva;
+     Ctrl+C cierra el programa; no se auto-despierta con su propia voz.
 
 ### Criterio de cierre
 
 Detecta la palabra >90% de las veces a distancia normal, corta solo al callar, y no se
 auto-despierta con su propia voz. Usuario aprueba y se actualiza este archivo.
+
+**FASE A COMPLETADA (2026-07-02).** Usuario probó el asistente completo en modo manos
+libres y confirmó que todo funciona: wake word, VAD, blip y sesión conversacional
+continua (sin repetir "Hey Jarvis" por turno, despedida cierra sesión no programa).
+Próximo paso, cuando el usuario lo pida: Fase B (function calling + herramientas).
 
 ## Fase B — Que haga cosas (v3): function calling + herramientas
 

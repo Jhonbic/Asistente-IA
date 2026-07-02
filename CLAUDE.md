@@ -3,6 +3,12 @@
 Asistente de voz local: micrófono → Whisper (STT local) → NVIDIA NIM (LLM en nube) →
 Piper (TTS local). La v1 (conversación por voz) está TERMINADA y funciona.
 
+Fase A / v2 (manos libres — wake word + VAD) TERMINADA y funciona (confirmado por el
+usuario 2026-07-02). Tras un solo "Hey Jarvis" se abre una sesión con turnos seguidos
+sin repetir la palabra; "adiós" cierra la sesión (no el programa) y vuelve a esperar
+"Hey Jarvis". Siguiente fase (no empezar sin que se pida): Fase B (function calling +
+herramientas), ver `PLAN.md`.
+
 **Lee `PLAN.md` antes de trabajar**: contiene la arquitectura, el estado por capas y todas
 las decisiones tomadas con su porqué. Actualízalo cuando se tomen decisiones nuevas.
 
@@ -20,7 +26,8 @@ las decisiones tomadas con su porqué. Actualízalo cuando se tomen decisiones n
   fuera del venv.
 - Asistente completo: `venv\Scripts\python.exe src\asistente.py`
 - Pruebas por capa: `src\test_capa1.py` (audio), `test_capa2.py` (STT), `test_capa3.py`
-  (chat LLM), `test_capa4.py` / `test_voces_mujer.py` (voces TTS).
+  (chat LLM), `test_capa4.py` / `test_voces_mujer.py` (voces TTS), `test_despertador.py`
+  (wake word), `test_vad.py` (corte automático de fin de frase).
 - Ejecutar siempre desde la raíz del proyecto.
 
 ## Arquitectura (src/)
@@ -30,7 +37,12 @@ las decisiones tomadas con su porqué. Actualízalo cuando se tomen decisiones n
 - `llm.py` — NIM vía SDK openai; modelo `qwen/qwen3-next-80b-a3b-instruct`; key en `.env`
   (`NVIDIA_API_KEY`); system prompt exige respuestas breves SIN markdown (se leen en voz alta)
 - `tts.py` — Piper, voz `es_AR-daniela-high`, voces en `models/piper/`
-- `asistente.py` — loop conversacional (une todo)
+- `despertador.py` — Fase A: wake word "hey_jarvis" con openWakeWord (ONNX), clase
+  `Despertador`, `UMBRAL_DETECCION = 0.1` (calibrado con el micrófono real del usuario)
+- `vad.py` — Fase A: corte automático de fin de frase con Silero VAD (ONNX, reutiliza el
+  modelo que ya descarga openWakeWord — sin `torch`), clase `EscuchaConVAD`
+- `asistente.py` — loop conversacional (une todo); aún en modo push-to-talk, pendiente
+  adaptar a manos libres
 
 ## Gotchas conocidos
 
@@ -43,6 +55,11 @@ las decisiones tomadas con su porqué. Actualízalo cuando se tomen decisiones n
   altavoces de la laptop.
 - Voces Piper nuevas: `python -m piper.download_voices <nombre> --data-dir models\piper`.
   Algunos modelos traen varios hablantes (`Voz(..., speaker_id=N)`).
+- Clips cortos con `sd.play()` + `sd.wait()` en Windows: `wait()` retorna cuando PortAudio
+  ENTREGA las muestras, no cuando suenan; al cerrarse el stream se descartan los últimos
+  ~0.2-0.5s que el mezclador aún tenía en cola. Un clip de 0.15s se pierde ENTERO (sin
+  error). Solución: rellenar con silencio al final (ver `RELLENO_BLIP` en `audio.py`).
+  Con audios largos (voz de Piper) el efecto es inaudible.
 
 ## Futuro acordado (no implementar sin que lo pida)
 

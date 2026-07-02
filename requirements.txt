@@ -13,3 +13,7 @@ python-dotenv
 
 # Capa 4 - TTS
 piper-tts
+
+# Fase A (v2) - manos libres: palabra de activación + VAD
+openwakeword
+onnxruntime
