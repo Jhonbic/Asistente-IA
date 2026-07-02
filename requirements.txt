@@ -1,0 +1,15 @@
+# Dependencias del asistente de voz (se instalan por capa, ver PLAN.md)
+
+# Capa 1 - captura de audio
+sounddevice
+numpy
+
+# Capa 2 - STT
+faster-whisper
+
+# Capa 3 - LLM (NVIDIA NIM via SDK de OpenAI)
+openai
+python-dotenv
+
+# Capa 4 - TTS
+piper-tts

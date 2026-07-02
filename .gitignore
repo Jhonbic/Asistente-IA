@@ -1,0 +1,15 @@
+# Entorno virtual
+venv/
+
+# Secretos — la API key de NVIDIA vive aquí y NUNCA debe subirse a git
+.env
+
+# Modelos descargados (pesados, se re-descargan)
+models/
+
+# Caches de Python
+__pycache__/
+*.pyc
+
+# Audio de pruebas
+*.wav
