@@ -29,6 +29,7 @@ import numpy as np
 
 import audio
 from despertador import Despertador
+from herramientas import obtener_avisos_pendientes
 from llm import Cerebro
 from stt import Transcriptor
 from tts import Voz
@@ -44,6 +45,19 @@ PALABRAS_SALIDA = ("adiós", "adios", "termina", "hasta luego", "chau", "chao")
 def es_despedida(texto: str) -> bool:
     t = texto.lower()
     return any(p in t for p in PALABRAS_SALIDA) and len(t.split()) <= 4
+
+
+def hablar_avisos_pendientes(voz: Voz) -> None:
+    """Habla por TTS los timers que vencieron desde la última vez que se revisó.
+
+    Los timers de herramientas.py corren en hilos aparte (threading.Timer) y
+    solo apilan su mensaje en una cola (obtener_avisos_pendientes); es acá,
+    desde el hilo principal, donde recién se convierten en voz — nunca desde
+    el hilo del timer, para no pisar un turno de conversación en curso.
+    """
+    for aviso in obtener_avisos_pendientes():
+        print(f"⏰ Aviso de timer: {aviso}\n")
+        voz.decir(aviso)
 
 
 def procesar_turno(grabacion: np.ndarray, transcriptor: Transcriptor, cerebro: Cerebro, voz: Voz) -> bool:
@@ -107,8 +121,12 @@ def loop_manos_libres(transcriptor: Transcriptor, cerebro: Cerebro, voz: Voz) ->
 
     try:
         while True:
+            hablar_avisos_pendientes(voz)  # por si venció mientras terminaba la sesión anterior
             print("😴 Esperando 'Hey Jarvis'...")
-            despertador.escuchar()
+            # en_cada_bloque corre cada ~80ms mientras se espera la palabra de
+            # activación: es la única ventana para avisar un timer que venza
+            # con el asistente "dormido" (sin sesión de conversación abierta).
+            despertador.escuchar(en_cada_bloque=lambda score: hablar_avisos_pendientes(voz))
             print("👂 ¡Te escucho!")
             audio.reproducir_blip()
 
@@ -116,6 +134,7 @@ def loop_manos_libres(transcriptor: Transcriptor, cerebro: Cerebro, voz: Voz) ->
             while en_sesion:
                 grabacion = escucha.grabar()
                 en_sesion = procesar_turno(grabacion, transcriptor, cerebro, voz)
+                hablar_avisos_pendientes(voz)
             print("💤 Sesión terminada. Esperando 'Hey Jarvis' de nuevo...\n")
     except KeyboardInterrupt:
         print("\nHasta luego.")
@@ -128,6 +147,7 @@ def loop_push_to_talk(transcriptor: Transcriptor, cerebro: Cerebro, voz: Voz) ->
     print("   Di 'adiós' para salir, o presiona Ctrl+C.\n")
 
     while True:
+        hablar_avisos_pendientes(voz)
         try:
             input("⏎  Enter para hablar...")
             grabacion = audio.grabar_push_to_talk()

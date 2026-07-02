@@ -17,3 +17,15 @@ piper-tts
 # Fase A (v2) - manos libres: palabra de activación + VAD
 openwakeword
 onnxruntime
+
+# Fase B (v3) - herramientas: apps/webs (reproducir video específico de YouTube)
+yt-dlp
+
+# Fase B (v3) - herramientas: búsqueda e info
+requests
+ddgs
+
+# Fase B (v3) - herramientas: control del sistema
+pycaw
+keyboard
+psutil

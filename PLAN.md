@@ -44,8 +44,8 @@
 
 ### Siguientes versiones (plan detallado más abajo, aprobado 2026-07-02)
 
-- [ ] Fase A (v2) — Manos libres: wake word + VAD
-- [ ] Fase B (v3) — Herramientas: function calling
+- [x] Fase A (v2) — Manos libres: wake word + VAD (completada 2026-07-02)
+- [x] Fase B (v3) — Herramientas: function calling (completada 2026-07-02)
 - [ ] Fase C (v4) — Siempre en segundo plano
 
 ---
@@ -365,6 +365,83 @@ de seguir): apps/webs → búsqueda e info → control del sistema → timers/re
 
 Los 4 grupos funcionan por voz, las acciones peligrosas piden confirmación, y una pregunta
 normal ("¿cómo estás?") sigue respondiendo sin invocar herramientas innecesarias.
+
+- 2026-07-02: Riesgo de la fase descartado con un smoke test aislado (tool ficticia
+  `obtener_clima`): `qwen/qwen3-next-80b-a3b-instruct` en NIM devuelve `tool_calls`
+  correctamente.
+- 2026-07-02: Módulo 1 (`src/herramientas.py` + `test_herramientas.py`) CERRADO, con luz
+  verde del usuario grupo por grupo. Registro central `HERRAMIENTAS` (nombre → función +
+  schema JSON) y despachador `ejecutar_herramienta()`.
+  - Grupo 1 (apps/webs): `abrir_app`, `abrir_web`, `buscar_en_google` (`os.startfile`/
+    `subprocess`, `webbrowser`, sin dependencias nuevas). Probado abriendo bloc de notas,
+    YouTube, una búsqueda de Google y la calculadora.
+  - Ampliación del grupo 1 (2026-07-02, pedida por el usuario): `reproducir_video_youtube`
+    para poner directamente un video específico, no solo abrir la búsqueda. Se evaluaron
+    `youtube-search-python` (sin mantenimiento desde 2020) y `ddgs.videos()` (backends
+    genéricos, no garantiza resultados de YouTube); se eligió `yt-dlp` con
+    `extract_flat=True` y prefijo `ytsearch1:<consulta>` — solo trae metadata del primer
+    resultado (sin descargar nada) y se abre su `webpage_url` con `webbrowser.open`,
+    igual que `abrir_web`; YouTube reproduce solo al cargar la página. Nueva dependencia
+    instalada sin problemas: `yt-dlp`. Probado con LLM real: el modelo elige esta
+    herramienta (no `abrir_web`) cuando se pide un video puntual.
+  - Grupo 2 (búsqueda e info): `obtener_clima` (Open-Meteo, geocoding + forecast, sin key)
+    y `buscar_info` (librería `ddgs`, no `duckduckgo-search` que está deprecada; devuelve
+    resúmenes de texto para que el LLM los redacte hablados, NO abre el navegador — eso lo
+    diferencia de `buscar_en_google`). Nueva dependencia instalada sin problemas: `ddgs`
+    (y `requests`, ya estaba disponible).
+  - Grupo 3 (sistema): `subir_bajar_volumen`, `silenciar_volumen` (`pycaw`; API actual usa
+    `AudioUtilities.GetSpeakers().EndpointVolume` directo, sin el `cast`/`comtypes` viejo
+    de los tutoriales), `control_multimedia` (`keyboard.send`), `estado_sistema`
+    (`psutil`: batería/CPU/RAM), `apagar_o_suspender_pc` (`subprocess` + `shutdown`).
+    Nuevas dependencias instaladas sin problemas: `pycaw`, `keyboard`, `psutil`.
+    Confirmación de acciones destructivas resuelta a nivel de la propia función, sin
+    esperar al Módulo 2: `apagar_o_suspender_pc(accion, confirmar)` con `confirmar=False`
+    NO ejecuta nada y devuelve un mensaje pidiendo confirmar; el schema le exige al LLM
+    llamarla primero sin confirmar y recién ejecutar con `confirmar=True` si el usuario
+    dijo que sí explícitamente.
+  - Grupo 4 (timers): `poner_timer`, `listar_timers`, `cancelar_timer` con
+    `threading.Timer`. Decisión de diseño: el callback del timer (corre en un hilo aparte)
+    NO habla directo por TTS — solo apila el mensaje en `_avisos_pendientes` (protegida
+    por `threading.Lock`); función interna `obtener_avisos_pendientes()` (sin schema, no
+    invocable por el LLM) vacía esa cola y la usará `asistente.py` desde el hilo principal
+    para hablar los avisos entre turnos (Módulo 3). Probado con timer de 3s: dispara,
+    aparece en la cola, y no se pierde ni duplica con otro timer cancelado en el medio.
+  - Requirements actualizado: `requests`, `ddgs`, `pycaw`, `keyboard`, `psutil`.
+  Próximo paso: Módulo 2 (function calling en `llm.py`).
+- 2026-07-02: Módulo 2 (`src/llm.py` + `test_capa3b.py`) implementado y probado. `tools=`
+  y `tool_choice="auto"` en la petición; bucle de hasta `MAX_LLAMADAS_HERRAMIENTAS = 3`
+  llamadas encadenadas; system prompt ampliado con la lista de herramientas y la regla de
+  confirmación para acciones destructivas.
+  - Bug encontrado en uso real (probando "reproducí una canción de Duki"): el modelo a
+    veces insiste llamando la MISMA herramienta "de apertura" (`abrir_app`, `abrir_web`,
+    `buscar_en_google`, `reproducir_video_youtube`) dos veces dentro del mismo turno
+    (ej: no le convence el primer resultado de búsqueda), abriendo dos pestañas/apps de
+    verdad para un solo pedido. Arreglado con una guarda por turno
+    (`HERRAMIENTAS_NO_REPETIBLES_POR_TURNO` + `_ejecutar_con_guarda`): la segunda llamada
+    a la misma herramienta "no repetible" en el mismo turno no se ejecuta de verdad, se le
+    devuelve un mensaje al modelo pidiéndole que responda con lo que ya tiene.
+  - Segundo bug relacionado: a veces Qwen3 (vía NIM) no usa el campo estructurado
+    `tool_calls` de la API y en cambio escribe la llamada como texto plano dentro de
+    `content` (formato `<tool_call>{...}</tool_call>`, artefacto de su plantilla de
+    entrenamiento). Sin manejarlo, ese texto crudo se leería literal por el TTS.
+    Arreglado con `_extraer_tool_call_de_texto()` (regex + `json.loads`): si se detecta,
+    se trata como una llamada real (con un `tool_call_id` fabricado) en vez de mostrarse
+    al usuario. Ambos arreglos verificados con pruebas dirigidas simulando la respuesta
+    del modelo (sin depender de que el bug no-determinista se repita solo).
+- 2026-07-02: Módulo 3 (`src/asistente.py`) implementado. Nueva función
+  `hablar_avisos_pendientes(voz)`: vacía la cola de `herramientas.obtener_avisos_pendientes()`
+  y dice cada aviso por TTS, siempre desde el hilo principal (nunca desde el hilo del
+  timer). Se revisa la cola en tres puntos: (1) al arrancar cada vuelta del loop manos
+  libres, por si un timer venció mientras terminaba la sesión anterior; (2) pasándola
+  como `en_cada_bloque` a `despertador.escuchar()` — la única ventana para avisar un
+  timer mientras el asistente está "dormido" esperando "Hey Jarvis", ya que ese método
+  llama el callback cada ~80ms mientras bloquea; (3) después de cada turno dentro de una
+  sesión. También se agregó al loop `--teclado` (antes de cada `input()`), aunque ahí el
+  caso de uso es menos relevante. Probado con timer real de 3s y una `Voz` de prueba:
+  no habla nada antes de vencer, habla una sola vez al vencer, no repite en pasadas
+  siguientes. **FASE B (v3) COMPLETADA** — los 4 grupos de herramientas funcionan por
+  voz end-to-end, con confirmación en acciones destructivas y timers avisando incluso
+  fuera de turno. Próxima fase (no empezar sin que se pida): Fase C (v4, segundo plano).
 
 ## Fase C — Siempre en segundo plano (v4)
 

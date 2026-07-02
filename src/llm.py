@@ -8,12 +8,16 @@ La API key vive en el archivo .env (que .gitignore excluye de git):
     NVIDIA_API_KEY=nvapi-...
 """
 
+import json
 import os
+import re
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI, RateLimitError
+
+from herramientas import HERRAMIENTAS, ejecutar_herramienta
 
 # Carga las variables del archivo .env de la raíz del proyecto.
 RAIZ = Path(__file__).resolve().parent.parent
@@ -34,11 +38,62 @@ Reglas importantes:
 - Tus respuestas se convierten a voz: sé breve (1-3 frases salvo que pidan detalle).
 - Nada de markdown, listas, asteriscos ni emojis: solo texto plano hablable.
 - Escribe los números como palabras cuando sea natural decirlos así.
-- Si no sabes algo, dilo honestamente y en corto."""
+- Si no sabes algo, dilo honestamente y en corto.
+- Tenés herramientas para hacer cosas en la PC (abrir apps/webs, buscar información,
+  dar el clima, controlar volumen y multimedia, ver batería/CPU/RAM, poner timers,
+  apagar o suspender la PC). Cuando el pedido del usuario coincida con una, usala en vez
+  de solo describir cómo hacerlo. Anunciá brevemente la acción que vas a hacer.
+- Apagar o suspender la PC es una acción DESTRUCTIVA: primero preguntale al usuario si
+  está seguro y llamá la herramienta con confirmar=false; solo volvé a llamarla con
+  confirmar=true si el usuario confirmó explícitamente que sí en su siguiente mensaje."""
 
 # Cuántos intercambios (usuario + asistente) recordar. Limita el costo en
 # tokens y evita que el historial crezca sin fin.
 MAX_INTERCAMBIOS = 10
+
+# Tope de llamadas a herramientas encadenadas dentro de un mismo turno, para
+# evitar que el modelo entre en un bucle infinito (herramienta -> herramienta -> ...).
+MAX_LLAMADAS_HERRAMIENTAS = 3
+
+# Schemas en el formato que espera la API `tools`: una lista con la entrada
+# "schema" de cada herramienta registrada en herramientas.py.
+TOOLS = [entrada["schema"] for entrada in HERRAMIENTAS.values()]
+
+# Herramientas que "abren algo" (pestaña, app): si el modelo no queda
+# conforme con el resultado (ej: un video mal elegido), a veces insiste
+# llamando la misma herramienta de nuevo dentro del mismo turno, y cada
+# llamada repite la acción real (segunda pestaña, segunda app abierta).
+# Estas no deben ejecutarse dos veces en el mismo turno.
+HERRAMIENTAS_NO_REPETIBLES_POR_TURNO = {
+    "abrir_app",
+    "abrir_web",
+    "buscar_en_google",
+    "reproducir_video_youtube",
+}
+
+# Qwen3 a veces, en vez de usar el campo estructurado tool_calls de la API,
+# escribe el intento de llamada como texto plano dentro del content (un
+# artefacto de su formato de entrenamiento). Si no lo detectamos, ese texto
+# crudo terminaría hablado por el TTS. Este patrón lo reconoce y permite
+# tratarlo como una llamada real.
+PATRON_TOOL_CALL_EN_TEXTO = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+def _extraer_tool_call_de_texto(texto: str):
+    """Si el texto contiene un tool_call en formato de texto plano, lo parsea.
+
+    Devuelve (nombre, argumentos_dict) o None si no hay nada que parsear.
+    """
+    if not texto:
+        return None
+    coincidencia = PATRON_TOOL_CALL_EN_TEXTO.search(texto)
+    if not coincidencia:
+        return None
+    try:
+        datos = json.loads(coincidencia.group(1))
+        return datos["name"], datos.get("arguments", {})
+    except (json.JSONDecodeError, KeyError):
+        return None
 
 
 class Cerebro:
@@ -62,32 +117,111 @@ class Cerebro:
         self.historial: list[dict] = []
 
     def responder(self, texto_usuario: str) -> str:
-        """Envía el texto del usuario y devuelve la respuesta del modelo."""
+        """Envía el texto del usuario y devuelve la respuesta del modelo.
+
+        Si el modelo decide usar una herramienta, la ejecuta, le devuelve el
+        resultado y vuelve a preguntarle qué decir; repite esto hasta
+        MAX_LLAMADAS_HERRAMIENTAS veces como máximo (evita bucles infinitos
+        si el modelo insiste en llamar herramientas sin parar).
+        """
         self.historial.append({"role": "user", "content": texto_usuario})
         self._recortar_historial()
 
+        # Registra qué herramientas "de una sola vez" ya se ejecutaron en
+        # este turno, para no repetirlas si el modelo insiste (ver
+        # HERRAMIENTAS_NO_REPETIBLES_POR_TURNO más arriba).
+        ejecutadas_este_turno: set[str] = set()
+
+        for _ in range(MAX_LLAMADAS_HERRAMIENTAS):
+            mensajes = [{"role": "system", "content": PROMPT_SISTEMA}] + self.historial
+            mensaje = self._pedir_completado(mensajes)
+
+            tool_calls = mensaje.tool_calls
+            if not tool_calls:
+                # A veces el modelo escribe la llamada como texto plano en
+                # vez de usar el campo estructurado de la API. La detectamos
+                # y la tratamos igual que una llamada real, para que no
+                # termine hablada literalmente por el TTS.
+                extraida = _extraer_tool_call_de_texto(mensaje.content)
+                if extraida is None:
+                    texto = (mensaje.content or "").strip()
+                    self.historial.append({"role": "assistant", "content": texto})
+                    return texto
+                nombre, argumentos = extraida
+                id_falso = f"texto-plano-{len(self.historial)}"
+                self.historial.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": id_falso,
+                                "type": "function",
+                                "function": {"name": nombre, "arguments": json.dumps(argumentos)},
+                            }
+                        ],
+                    }
+                )
+                resultado = self._ejecutar_con_guarda(nombre, argumentos, ejecutadas_este_turno)
+                self.historial.append({"role": "tool", "tool_call_id": id_falso, "content": resultado})
+                continue
+
+            # El modelo pidió usar una o más herramientas: las ejecutamos y le
+            # devolvemos el resultado para que arme la respuesta final.
+            self.historial.append(
+                {
+                    "role": "assistant",
+                    "content": mensaje.content,
+                    "tool_calls": [tc.model_dump() for tc in tool_calls],
+                }
+            )
+            for llamada in tool_calls:
+                argumentos = json.loads(llamada.function.arguments)
+                resultado = self._ejecutar_con_guarda(
+                    llamada.function.name, argumentos, ejecutadas_este_turno
+                )
+                self.historial.append(
+                    {"role": "tool", "tool_call_id": llamada.id, "content": resultado}
+                )
+
+        # Se agotaron los intentos: pedimos una respuesta final sin permitir
+        # más herramientas, para no dejar al usuario sin contestación.
         mensajes = [{"role": "system", "content": PROMPT_SISTEMA}] + self.historial
+        mensaje = self._pedir_completado(mensajes, permitir_herramientas=False)
+        texto = (mensaje.content or "").strip()
+        self.historial.append({"role": "assistant", "content": texto})
+        return texto
+
+    def _ejecutar_con_guarda(self, nombre: str, argumentos: dict, ejecutadas_este_turno: set) -> str:
+        """Ejecuta una herramienta, salvo que sea 'no repetible' y ya se haya usado este turno."""
+        if nombre in HERRAMIENTAS_NO_REPETIBLES_POR_TURNO and nombre in ejecutadas_este_turno:
+            return (
+                "Esa acción ya se ejecutó en este turno, no la repitas: "
+                "respondé directo con el resultado que ya tenés."
+            )
+        ejecutadas_este_turno.add(nombre)
+        return ejecutar_herramienta(nombre, argumentos)
+
+    def _pedir_completado(self, mensajes: list[dict], permitir_herramientas: bool = True):
+        """Llama a la API con reintento ante rate limit; devuelve el mensaje de la respuesta."""
+        kwargs = dict(
+            model=self.modelo,
+            messages=mensajes,
+            temperature=0.7,   # algo de variedad sin divagar
+            max_tokens=300,    # tope de largo: es un asistente hablado
+        )
+        if permitir_herramientas:
+            kwargs["tools"] = TOOLS
+            kwargs["tool_choice"] = "auto"
 
         try:
-            respuesta = self.client.chat.completions.create(
-                model=self.modelo,
-                messages=mensajes,
-                temperature=0.7,   # algo de variedad sin divagar
-                max_tokens=300,    # tope de largo: es un asistente hablado
-            )
+            respuesta = self.client.chat.completions.create(**kwargs)
         except RateLimitError:
             # Límite de ~40 req/min de NIM: esperamos un poco y reintentamos una vez.
             time.sleep(3)
-            respuesta = self.client.chat.completions.create(
-                model=self.modelo,
-                messages=mensajes,
-                temperature=0.7,
-                max_tokens=300,
-            )
+            respuesta = self.client.chat.completions.create(**kwargs)
 
-        texto = respuesta.choices[0].message.content.strip()
-        self.historial.append({"role": "assistant", "content": texto})
-        return texto
+        return respuesta.choices[0].message
 
     def _recortar_historial(self) -> None:
         """Conserva solo los últimos MAX_INTERCAMBIOS pares de mensajes."""

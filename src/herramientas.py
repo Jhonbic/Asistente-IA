@@ -1,0 +1,669 @@
+"""Fase B - Herramientas que el LLM puede invocar (function calling).
+
+Cada herramienta es una función normal de Python + un "schema" en formato
+JSON que le describe al LLM qué hace y qué parámetros acepta (el LLM nunca
+ejecuta código: solo elige el nombre y arma los argumentos; nosotros
+ejecutamos la función real).
+
+El registro HERRAMIENTAS es el punto central: agregar una herramienta nueva
+es escribir la función + agregar su entrada acá. `llm.py` (Módulo 2 de la
+Fase B) leerá este registro para armar el parámetro `tools=` del pedido a
+NIM y para despachar los `tool_calls` que devuelva el modelo.
+"""
+
+import itertools
+import subprocess
+import threading
+import webbrowser
+
+import keyboard
+import psutil
+import requests
+from ddgs import DDGS
+from pycaw.pycaw import AudioUtilities
+from yt_dlp import YoutubeDL
+
+# Atajos de apps de Windows más comunes: nombre que puede decir el usuario
+# -> comando para abrirla. `notepad`, `calc`, etc. son ejecutables que
+# Windows resuelve solos sin necesitar la ruta completa.
+APPS_CONOCIDAS = {
+    "bloc de notas": "notepad",
+    "notepad": "notepad",
+    "calculadora": "calc",
+    "explorador de archivos": "explorer",
+    "paint": "mspaint",
+    "word": "winword",
+    "excel": "excel",
+    "spotify": "spotify",
+    "discord": "discord",
+    "chrome": "chrome",
+}
+
+# Atajos de sitios web comunes: nombre -> URL. Si el usuario pide un sitio
+# que no está acá, `abrir_web` intenta armar la URL a partir del nombre.
+WEBS_CONOCIDAS = {
+    "youtube": "https://youtube.com",
+    "gmail": "https://mail.google.com",
+    "whatsapp": "https://web.whatsapp.com",
+    "github": "https://github.com",
+    "netflix": "https://netflix.com",
+}
+
+
+def abrir_app(nombre: str) -> str:
+    """Abre una aplicación de Windows por nombre."""
+    comando = APPS_CONOCIDAS.get(nombre.lower().strip())
+    if comando is None:
+        return f"No conozco la aplicación '{nombre}', no la pude abrir."
+    try:
+        subprocess.Popen(comando, shell=True)
+        return f"Abriendo {nombre}."
+    except Exception as error:
+        return f"No pude abrir {nombre}: {error}"
+
+
+def abrir_web(sitio: str) -> str:
+    """Abre un sitio web en el navegador por defecto, por nombre o URL."""
+    sitio_normalizado = sitio.lower().strip()
+    if sitio_normalizado.startswith("http://") or sitio_normalizado.startswith("https://"):
+        url = sitio
+    elif sitio_normalizado in WEBS_CONOCIDAS:
+        url = WEBS_CONOCIDAS[sitio_normalizado]
+    else:
+        # Mejor esfuerzo: asumimos que es un dominio ".com" válido.
+        url = f"https://{sitio_normalizado.replace(' ', '')}.com"
+
+    try:
+        webbrowser.open(url)
+        return f"Abriendo {sitio} en el navegador."
+    except Exception as error:
+        return f"No pude abrir {sitio}: {error}"
+
+
+def buscar_en_google(consulta: str) -> str:
+    """Abre una búsqueda de Google en el navegador con la consulta dada."""
+    from urllib.parse import quote_plus
+
+    url = f"https://www.google.com/search?q={quote_plus(consulta)}"
+    try:
+        webbrowser.open(url)
+        return f"Buscando '{consulta}' en Google."
+    except Exception as error:
+        return f"No pude buscar '{consulta}': {error}"
+
+
+def reproducir_video_youtube(consulta: str) -> str:
+    """Busca en YouTube y abre directamente el primer resultado (empieza a reproducirse solo).
+
+    A diferencia de abrir_web/buscar_en_google, esto NO abre una página de
+    resultados: usa yt-dlp para resolver la búsqueda a una URL de video
+    concreta (sin descargar nada, solo metadata) y la abre.
+    """
+    opciones = {"quiet": True, "extract_flat": True, "noplaylist": True}
+    try:
+        with YoutubeDL(opciones) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{consulta}", download=False)
+        entradas = info.get("entries") or []
+        if not entradas:
+            return f"No encontré ningún video de '{consulta}' en YouTube."
+
+        primero = entradas[0]
+        url = primero.get("url") or primero.get("webpage_url")
+        titulo = primero.get("title", consulta)
+        webbrowser.open(url)
+        return f"Reproduciendo '{titulo}' en YouTube."
+    except Exception as error:
+        return f"No pude reproducir '{consulta}' en YouTube: {error}"
+
+
+# Traduce los códigos WMO que devuelve Open-Meteo a una descripción hablable
+# en español. No cubre todos los códigos posibles, solo los más comunes.
+DESCRIPCION_CLIMA = {
+    0: "despejado",
+    1: "mayormente despejado",
+    2: "parcialmente nublado",
+    3: "nublado",
+    45: "con niebla",
+    48: "con niebla helada",
+    51: "con llovizna leve",
+    53: "con llovizna moderada",
+    55: "con llovizna intensa",
+    61: "con lluvia leve",
+    63: "con lluvia moderada",
+    65: "con lluvia intensa",
+    71: "con nevadas leves",
+    73: "con nevadas moderadas",
+    75: "con nevadas intensas",
+    80: "con chubascos",
+    95: "con tormenta",
+}
+
+
+def obtener_clima(ciudad: str) -> str:
+    """Consulta el clima actual de una ciudad usando la API gratuita Open-Meteo."""
+    try:
+        geo = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": ciudad, "count": 1, "language": "es"},
+            timeout=10,
+        ).json()
+        resultados = geo.get("results")
+        if not resultados:
+            return f"No encontré la ciudad '{ciudad}'."
+
+        lugar = resultados[0]
+        clima = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lugar["latitude"],
+                "longitude": lugar["longitude"],
+                "current": "temperature_2m,weather_code",
+            },
+            timeout=10,
+        ).json()["current"]
+
+        temperatura = round(clima["temperature_2m"])
+        descripcion = DESCRIPCION_CLIMA.get(clima["weather_code"], "")
+        nombre_lugar = lugar["name"]
+        if descripcion:
+            return f"En {nombre_lugar} hace {temperatura} grados y está {descripcion}."
+        return f"En {nombre_lugar} hace {temperatura} grados."
+    except Exception as error:
+        return f"No pude obtener el clima de {ciudad}: {error}"
+
+
+def buscar_info(consulta: str) -> str:
+    """Busca en la web y devuelve un resumen de texto de los primeros resultados.
+
+    A diferencia de buscar_en_google, esto NO abre el navegador: trae el
+    texto para que el LLM lo lea y redacte una respuesta hablada.
+    """
+    try:
+        resultados = list(DDGS().text(consulta, max_results=3))
+        if not resultados:
+            return f"No encontré resultados para '{consulta}'."
+        resumen = "\n".join(f"- {r['title']}: {r['body']}" for r in resultados)
+        return resumen
+    except Exception as error:
+        return f"No pude buscar '{consulta}': {error}"
+
+
+def _volumen_windows():
+    """Devuelve la interfaz de control de volumen del dispositivo de salida por defecto."""
+    return AudioUtilities.GetSpeakers().EndpointVolume
+
+
+def subir_bajar_volumen(direccion: str) -> str:
+    """Sube o baja el volumen general de Windows en pasos del 10%."""
+    volumen = _volumen_windows()
+    nivel_actual = volumen.GetMasterVolumeLevelScalar()
+
+    if direccion.lower().strip() == "subir":
+        nuevo_nivel = min(1.0, nivel_actual + 0.1)
+    elif direccion.lower().strip() == "bajar":
+        nuevo_nivel = max(0.0, nivel_actual - 0.1)
+    else:
+        return f"No entendí la dirección '{direccion}', debe ser 'subir' o 'bajar'."
+
+    volumen.SetMasterVolumeLevelScalar(nuevo_nivel, None)
+    return f"Volumen al {round(nuevo_nivel * 100)} por ciento."
+
+
+def silenciar_volumen(silenciar: bool) -> str:
+    """Silencia o reactiva el audio del sistema."""
+    volumen = _volumen_windows()
+    volumen.SetMute(1 if silenciar else 0, None)
+    return "Audio silenciado." if silenciar else "Audio reactivado."
+
+
+def control_multimedia(accion: str) -> str:
+    """Envía una tecla multimedia (play/pausa, siguiente, anterior) al reproductor activo."""
+    teclas = {
+        "reproducir": "play/pause media",
+        "pausar": "play/pause media",
+        "siguiente": "next track",
+        "anterior": "previous track",
+    }
+    tecla = teclas.get(accion.lower().strip())
+    if tecla is None:
+        return f"No conozco la acción multimedia '{accion}'."
+    keyboard.send(tecla)
+    return f"Listo: {accion}."
+
+
+def estado_sistema() -> str:
+    """Informa batería, uso de CPU y de RAM actuales."""
+    partes = []
+
+    bateria = psutil.sensors_battery()
+    if bateria is not None:
+        estado = "cargando" if bateria.power_plugged else "sin cargador"
+        partes.append(f"batería al {round(bateria.percent)} por ciento, {estado}")
+    else:
+        partes.append("sin información de batería (parece ser una PC de escritorio)")
+
+    partes.append(f"CPU al {round(psutil.cpu_percent(interval=0.5))} por ciento")
+    partes.append(f"memoria RAM al {round(psutil.virtual_memory().percent)} por ciento")
+
+    return "; ".join(partes) + "."
+
+
+def apagar_o_suspender_pc(accion: str, confirmar: bool) -> str:
+    """Apaga o suspende la PC. Es DESTRUCTIVA: solo ejecuta si confirmar=True.
+
+    El modelo debe primero preguntarle al usuario y llamar esta función de
+    nuevo con confirmar=True solo si el usuario dijo que sí.
+    """
+    accion_normalizada = accion.lower().strip()
+    if accion_normalizada not in ("apagar", "suspender"):
+        return f"No entendí la acción '{accion}', debe ser 'apagar' o 'suspender'."
+
+    if not confirmar:
+        return (
+            f"Esto va a {accion} la PC. Confirmame que querés hacerlo antes de "
+            "ejecutarlo de nuevo con la confirmación."
+        )
+
+    try:
+        if accion_normalizada == "apagar":
+            subprocess.run(["shutdown", "/s", "/t", "5"], check=True)
+            return "Apagando la PC en 5 segundos."
+        else:
+            subprocess.run(["shutdown", "/h"], check=True)
+            return "Suspendiendo la PC."
+    except Exception as error:
+        return f"No pude {accion} la PC: {error}"
+
+
+# --- Timers / recordatorios --------------------------------------------
+#
+# threading.Timer corre el callback en un hilo aparte, en paralelo al loop
+# principal de voz. Por eso NO hablamos directamente desde ese hilo (Piper
+# y sounddevice no son necesariamente seguros para llamarse desde dos hilos
+# a la vez, y además pisaría el turno de voz en curso). En su lugar, el
+# callback solo apila el mensaje en `_avisos_pendientes`; es asistente.py
+# (Módulo 3 de la Fase B) el que, entre turnos, llama a
+# `obtener_avisos_pendientes()` desde el hilo principal y recién ahí habla.
+# `_lock_timers` protege el diccionario y la lista porque se tocan desde
+# el hilo principal (poner/cancelar/listar) y desde los hilos de los
+# timers (al vencer) al mismo tiempo.
+
+_contador_timers = itertools.count(1)
+_timers_activos: dict[int, tuple[threading.Timer, str, float]] = {}
+_avisos_pendientes: list[str] = []
+_lock_timers = threading.Lock()
+
+
+def _avisar_timer(id_timer: int, mensaje: str) -> None:
+    with _lock_timers:
+        _timers_activos.pop(id_timer, None)
+        _avisos_pendientes.append(mensaje)
+
+
+def poner_timer(minutos: float, mensaje: str = "") -> str:
+    """Programa un aviso para dentro de X minutos (acepta decimales, ej 0.5 = 30s)."""
+    if minutos <= 0:
+        return "La duración del timer tiene que ser mayor a cero minutos."
+
+    texto_aviso = mensaje.strip() if mensaje and mensaje.strip() else f"Pasaron {minutos} minutos."
+    id_timer = next(_contador_timers)
+
+    timer = threading.Timer(minutos * 60, _avisar_timer, args=(id_timer, texto_aviso))
+    timer.daemon = True  # no debe impedir que el programa cierre con Ctrl+C
+    with _lock_timers:
+        _timers_activos[id_timer] = (timer, texto_aviso, minutos)
+    timer.start()
+
+    return f"Timer puesto: en {minutos} minutos te aviso '{texto_aviso}'."
+
+
+def listar_timers() -> str:
+    """Lista los timers activos que todavía no vencieron."""
+    with _lock_timers:
+        if not _timers_activos:
+            return "No hay timers activos."
+        partes = [f"'{mensaje}' en {minutos} minutos" for _, mensaje, minutos in _timers_activos.values()]
+    return "Timers activos: " + "; ".join(partes) + "."
+
+
+def cancelar_timer(mensaje: str = "") -> str:
+    """Cancela un timer activo. Sin mensaje cancela el más reciente; con mensaje busca coincidencia."""
+    with _lock_timers:
+        if not _timers_activos:
+            return "No hay timers activos para cancelar."
+
+        if mensaje and mensaje.strip():
+            candidatos = [
+                (id_, datos) for id_, datos in _timers_activos.items() if mensaje.lower().strip() in datos[1].lower()
+            ]
+            if not candidatos:
+                return f"No encontré un timer que coincida con '{mensaje}'."
+            id_a_cancelar, (timer, texto, _) = candidatos[0]
+        else:
+            id_a_cancelar, (timer, texto, _) = next(iter(_timers_activos.items()))
+
+        timer.cancel()
+        del _timers_activos[id_a_cancelar]
+
+    return f"Cancelé el timer '{texto}'."
+
+
+def obtener_avisos_pendientes() -> list[str]:
+    """Devuelve y vacía la lista de avisos de timers ya vencidos.
+
+    No es una herramienta invocable por el LLM (no tiene schema ni está en
+    el registro): la usará el loop de asistente.py para hablar los avisos
+    entre turnos, desde el hilo principal.
+    """
+    with _lock_timers:
+        avisos = list(_avisos_pendientes)
+        _avisos_pendientes.clear()
+    return avisos
+
+
+# Registro central: cada entrada tiene la función real y su schema JSON en
+# el formato que espera la API `tools` de OpenAI/NIM.
+HERRAMIENTAS = {
+    "abrir_app": {
+        "funcion": abrir_app,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "abrir_app",
+                "description": (
+                    "Abre una aplicación instalada en la PC de Windows, como el "
+                    "bloc de notas, la calculadora, Spotify, Discord, etc."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "nombre": {
+                            "type": "string",
+                            "description": "Nombre de la aplicación a abrir, tal como la nombró el usuario.",
+                        },
+                    },
+                    "required": ["nombre"],
+                },
+            },
+        },
+    },
+    "abrir_web": {
+        "funcion": abrir_web,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "abrir_web",
+                "description": "Abre un sitio web en el navegador por defecto, dado su nombre o URL.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sitio": {
+                            "type": "string",
+                            "description": "Nombre del sitio (ej: 'youtube') o URL completa a abrir.",
+                        },
+                    },
+                    "required": ["sitio"],
+                },
+            },
+        },
+    },
+    "buscar_en_google": {
+        "funcion": buscar_en_google,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "buscar_en_google",
+                "description": "Busca una consulta en Google y abre los resultados en el navegador.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "consulta": {
+                            "type": "string",
+                            "description": "Texto a buscar en Google.",
+                        },
+                    },
+                    "required": ["consulta"],
+                },
+            },
+        },
+    },
+    "reproducir_video_youtube": {
+        "funcion": reproducir_video_youtube,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "reproducir_video_youtube",
+                "description": (
+                    "Busca un video en YouTube y lo abre directamente para que empiece a "
+                    "reproducirse (a diferencia de abrir_web/buscar_en_google, que solo "
+                    "abren una página). Usar cuando el usuario pida ver o poner un video "
+                    "o canción específica en YouTube."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "consulta": {
+                            "type": "string",
+                            "description": "Qué video buscar y reproducir en YouTube.",
+                        },
+                    },
+                    "required": ["consulta"],
+                },
+            },
+        },
+    },
+    "obtener_clima": {
+        "funcion": obtener_clima,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "obtener_clima",
+                "description": "Da el clima actual (temperatura y condición) de una ciudad.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ciudad": {
+                            "type": "string",
+                            "description": "Nombre de la ciudad de la que se quiere el clima.",
+                        },
+                    },
+                    "required": ["ciudad"],
+                },
+            },
+        },
+    },
+    "buscar_info": {
+        "funcion": buscar_info,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "buscar_info",
+                "description": (
+                    "Busca información en la web sobre un tema o pregunta y devuelve un "
+                    "resumen de texto (no abre el navegador). Usar para preguntas de "
+                    "conocimiento general, noticias o datos que el modelo no sepa de memoria."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "consulta": {
+                            "type": "string",
+                            "description": "Qué buscar en la web.",
+                        },
+                    },
+                    "required": ["consulta"],
+                },
+            },
+        },
+    },
+    "subir_bajar_volumen": {
+        "funcion": subir_bajar_volumen,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "subir_bajar_volumen",
+                "description": "Sube o baja el volumen general del sistema en pasos del 10%.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "direccion": {
+                            "type": "string",
+                            "enum": ["subir", "bajar"],
+                            "description": "Si hay que subir o bajar el volumen.",
+                        },
+                    },
+                    "required": ["direccion"],
+                },
+            },
+        },
+    },
+    "silenciar_volumen": {
+        "funcion": silenciar_volumen,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "silenciar_volumen",
+                "description": "Silencia o reactiva el audio del sistema.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "silenciar": {
+                            "type": "boolean",
+                            "description": "true para silenciar, false para reactivar el sonido.",
+                        },
+                    },
+                    "required": ["silenciar"],
+                },
+            },
+        },
+    },
+    "control_multimedia": {
+        "funcion": control_multimedia,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "control_multimedia",
+                "description": "Controla la reproducción multimedia: reproducir, pausar, siguiente o anterior.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "accion": {
+                            "type": "string",
+                            "enum": ["reproducir", "pausar", "siguiente", "anterior"],
+                            "description": "Acción multimedia a ejecutar.",
+                        },
+                    },
+                    "required": ["accion"],
+                },
+            },
+        },
+    },
+    "estado_sistema": {
+        "funcion": estado_sistema,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "estado_sistema",
+                "description": "Informa el estado actual de batería, uso de CPU y de memoria RAM de la PC.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+        },
+    },
+    "apagar_o_suspender_pc": {
+        "funcion": apagar_o_suspender_pc,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "apagar_o_suspender_pc",
+                "description": (
+                    "Apaga o suspende la PC. Es una acción DESTRUCTIVA: siempre hay que "
+                    "preguntarle al usuario primero y llamar esta función con "
+                    "confirmar=false para avisarle; solo volver a llamarla con "
+                    "confirmar=true si el usuario confirmó explícitamente que sí."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "accion": {
+                            "type": "string",
+                            "enum": ["apagar", "suspender"],
+                            "description": "Qué hacer con la PC.",
+                        },
+                        "confirmar": {
+                            "type": "boolean",
+                            "description": "true solo si el usuario ya confirmó explícitamente la acción.",
+                        },
+                    },
+                    "required": ["accion", "confirmar"],
+                },
+            },
+        },
+    },
+    "poner_timer": {
+        "funcion": poner_timer,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "poner_timer",
+                "description": "Programa un timer/recordatorio para avisar por voz dentro de X minutos.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "minutos": {
+                            "type": "number",
+                            "description": "Minutos hasta el aviso. Puede tener decimales (ej: 0.5 = 30 segundos).",
+                        },
+                        "mensaje": {
+                            "type": "string",
+                            "description": "Qué recordar al vencer. Opcional; si no se da, se avisa genéricamente.",
+                        },
+                    },
+                    "required": ["minutos"],
+                },
+            },
+        },
+    },
+    "listar_timers": {
+        "funcion": listar_timers,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "listar_timers",
+                "description": "Lista los timers/recordatorios activos que todavía no vencieron.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+    },
+    "cancelar_timer": {
+        "funcion": cancelar_timer,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "cancelar_timer",
+                "description": "Cancela un timer activo. Sin mensaje cancela el más reciente.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mensaje": {
+                            "type": "string",
+                            "description": "Texto para identificar qué timer cancelar (opcional).",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+    },
+}
+
+
+def ejecutar_herramienta(nombre: str, argumentos: dict) -> str:
+    """Despacha una llamada a herramienta por nombre y devuelve el resultado como texto."""
+    entrada = HERRAMIENTAS.get(nombre)
+    if entrada is None:
+        return f"Herramienta desconocida: {nombre}"
+    return entrada["funcion"](**argumentos)
