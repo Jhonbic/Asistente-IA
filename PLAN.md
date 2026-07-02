@@ -33,12 +33,20 @@
 
 ## Estado de avance
 
+### v1 — Conversación por voz (TERMINADA)
+
 - [x] Capa 0 — Preparación del entorno (completada 2026-07-01)
 - [x] Capa 1 — Captura de audio (completada 2026-07-01: `src/audio.py`, probada con voz real)
 - [x] Capa 2 — STT (completada 2026-07-01: `src/stt.py`, modelo elegido: `small`)
 - [x] Capa 3 — LLM (completada 2026-07-01: `src/llm.py`, modelo `qwen/qwen3-next-80b-a3b-instruct`)
 - [x] Capa 4 — TTS (completada 2026-07-01: `src/tts.py`, voz elegida: `es_AR-daniela-high`)
 - [x] Capa 5 — Loop conversacional (completada 2026-07-01: `src/asistente.py`)
+
+### Siguientes versiones (plan detallado más abajo, aprobado 2026-07-02)
+
+- [ ] Fase A (v2) — Manos libres: wake word + VAD
+- [ ] Fase B (v3) — Herramientas: function calling
+- [ ] Fase C (v4) — Siempre en segundo plano
 
 ---
 
@@ -168,3 +176,167 @@
   wav→STT→LLM→TTS: OK. Latencia estimada por turno (modelos ya cargados): ~4-5s.
   **v1 TERMINADA.** Siguiente etapa (futuro): function calling en la Capa 3 para
   ejecutar comandos y abrir apps, sin tocar las demás capas.
+- 2026-07-02: Plan de las fases A/B/C (v2–v4) definido y aprobado (ver sección siguiente).
+  Decisiones del usuario: motor de wake word = **openWakeWord** (gratis, sin cuenta);
+  Fase B incluye los 4 grupos de herramientas (apps/webs, timers, sistema, búsqueda e info).
+
+---
+
+# Plan v2 → v4: Fases A, B y C
+
+> Detalle de las siguientes versiones (origen: `VERSIONES.md`). Misma metodología que la
+> v1: cada módulo nuevo se prueba aislado con su `test_*.py` antes de conectarse, y no se
+> pasa a la fase siguiente sin aprobación del usuario.
+
+Reglas transversales (heredadas de la v1):
+- Todo corre en el venv (`venv\Scripts\python.exe`), pesado en CPU, código y comentarios en español.
+- Scripts ejecutables llevan `sys.stdout.reconfigure(encoding="utf-8")`.
+- Al cerrar cada fase se actualiza este archivo con las decisiones tomadas.
+
+## Fase A — Manos libres (v2): wake word + VAD
+
+**Meta:** hablar sin teclado. Loop: esperar "Hey Jarvis" → sonido de confirmación → grabar
+hasta que dejes de hablar → transcribir → responder → volver a esperar.
+
+### Tecnologías
+
+| Necesidad | Elección | Por qué |
+|---|---|---|
+| Palabra de activación | `openwakeword` (+ `onnxruntime`) | Gratis, sin cuenta, ~1-3% CPU, modelo preentrenado `hey_jarvis` |
+| Fin de frase automático | `silero-vad` (ONNX, sin torch) | Estándar de facto, liviano en CPU, detecta silencio real (no solo volumen) |
+| Captura continua | `sounddevice.InputStream` | Ya se usa en `audio.py`; se reutiliza el mismo patrón de callback |
+
+Riesgo a verificar al iniciar la fase: que `openwakeword` + `onnxruntime` instalen bien en
+Python 3.13 (verificar con `pip install --dry-run` como se hizo en Capa 0). Plan B si falla:
+Porcupine (requiere cuenta Picovoice).
+
+### Módulos y prueba aislada
+
+1. **`src/despertador.py`** — clase `Despertador`: stream de micrófono permanente que alimenta
+   openWakeWord en bloques de 80ms y dispara un evento al detectar la palabra.
+   - *Prueba:* `test_despertador.py` — imprime "¡DESPERTÉ!" + score cada vez que se dice
+     "Hey Jarvis"; medir falsos positivos dejándolo escuchar TV/música unos minutos y
+     calibrar el umbral (constante `UMBRAL_DETECCION`).
+2. **`src/vad.py`** — clase `EscuchaConVAD`: graba tras el despertar y corta sola tras
+   ~1s de silencio (silero-vad frame a frame), con tope máximo de ~15s por frase.
+   - *Prueba:* `test_vad.py` — hablar, callar, verificar que corta solo; guarda el `.wav`
+     y lo transcribe con la Capa 2 para confirmar que no recorta palabras.
+3. **`src/audio.py`** (ampliar, no romper) — sonido corto de confirmación ("blip" generado
+   con numpy, sin archivos externos). `grabar_push_to_talk()` se conserva intacto como respaldo.
+4. **`src/asistente.py`** (adaptar) — nuevo loop manos libres; flag `--teclado` para arrancar
+   en modo push-to-talk clásico. La cadena STT→LLM→TTS no se toca.
+   - *Prueba de integración:* conversación completa sin tocar el teclado, varios turnos;
+     verificar que mientras el asistente habla no se dispara a sí mismo (pausar el
+     despertador durante el TTS).
+
+### Criterio de cierre
+
+Detecta la palabra >90% de las veces a distancia normal, corta solo al callar, y no se
+auto-despierta con su propia voz. Usuario aprueba y se actualiza este archivo.
+
+## Fase B — Que haga cosas (v3): function calling + herramientas
+
+**Meta:** el LLM deja de solo conversar: decide cuándo invocar funciones de Python
+(herramientas) y responde por voz con el resultado.
+
+### Tecnologías
+
+| Necesidad | Elección | Por qué |
+|---|---|---|
+| Function calling | API `tools` del SDK openai contra NIM (Qwen3 soporta tool use) | Mismo SDK ya usado en `llm.py`; solo se agrega el parámetro `tools` y el manejo de `tool_calls` |
+| Abrir apps/webs | `os.startfile`, `webbrowser`, `subprocess` (stdlib) | Sin dependencias nuevas |
+| Timers/recordatorios | `threading.Timer` (stdlib) | Suficiente para v3; enseña concurrencia. El aviso habla por el TTS existente |
+| Volumen | `pycaw` | Control nativo del mezclador de Windows |
+| Multimedia (play/pausa/siguiente) | `keyboard` (teclas multimedia) | Simple y funciona con cualquier reproductor |
+| Batería/CPU/RAM | `psutil` | Estándar |
+| Suspender/apagar | `shutdown` vía `subprocess` | Stdlib; **siempre con confirmación por voz previa** |
+| Clima | API Open-Meteo (gratis, sin key) + `requests` | Sin registro |
+| Búsqueda web | `ddgs` (DuckDuckGo) | Sin API key; devuelve resúmenes que el LLM redacta hablados |
+
+Riesgo a verificar al iniciar la fase: confirmar con una petición real que
+`qwen/qwen3-next-80b-a3b-instruct` en NIM devuelve `tool_calls` correctamente
+(smoke test antes de construir nada encima). Plan B: `meta/llama-4-maverick-17b-128e-instruct`.
+
+### Módulos y prueba aislada
+
+1. **`src/herramientas.py`** — cada herramienta es una función de Python con su schema
+   JSON (nombre, descripción, parámetros) en un registro central `HERRAMIENTAS`. Agregar una
+   herramienta nueva = escribir una función + su schema, nada más.
+   - *Prueba:* `test_herramientas.py` — ejecuta cada función directamente (sin LLM ni voz)
+     y verifica el resultado: abre el navegador, sube el volumen, da el clima, etc.
+2. **`src/llm.py`** (ampliar `Cerebro`) — enviar `tools=` en la petición; si la respuesta
+   trae `tool_calls`, ejecutar vía despachador, devolver el resultado con `role="tool"` y
+   pedir la respuesta final hablada. Bucle con máximo de ~3 llamadas encadenadas por turno
+   (evitar loops infinitos). Ampliar el system prompt: anunciar la acción brevemente y
+   pedir confirmación para acciones destructivas (apagar/suspender).
+   - *Prueba:* `test_capa3b.py` — chat por texto en terminal (sin audio): "pon un timer de
+     un minuto", "¿cuánta batería queda?", "abre YouTube" → verificar que elige la
+     herramienta correcta, la ejecuta y redacta el resultado hablable.
+3. **`src/asistente.py`** (mínimo cambio) — los recordatorios vencidos hablan por el TTS
+   aun si saltan fuera de un turno (cola de avisos que el loop revisa).
+   - *Prueba de integración:* por voz, un pedido de cada grupo de herramientas.
+
+Orden de implementación dentro de la fase (de simple a complejo, cada una probada antes
+de seguir): apps/webs → búsqueda e info → control del sistema → timers/recordatorios
+(la más compleja por la concurrencia con el loop de voz).
+
+### Criterio de cierre
+
+Los 4 grupos funcionan por voz, las acciones peligrosas piden confirmación, y una pregunta
+normal ("¿cómo estás?") sigue respondiendo sin invocar herramientas innecesarias.
+
+## Fase C — Siempre en segundo plano (v4)
+
+**Meta:** el asistente arranca solo con Windows, vive en la bandeja del sistema y se
+recupera de fallos sin morir.
+
+### Tecnologías
+
+| Necesidad | Elección | Por qué |
+|---|---|---|
+| Ícono de bandeja | `pystray` + `Pillow` | Estándar en Windows/Python; menú clic derecho |
+| Sin ventana de consola | `pythonw.exe` del venv | Ya viene con Python, cero dependencias |
+| Autoarranque | Programador de tareas de Windows ("al iniciar sesión") | Más robusto que la carpeta Inicio; permite retraso y reinicio en fallo |
+| Logs (la consola ya no existe) | `logging` a `logs/asistente.log` con rotación (`RotatingFileHandler`) | Stdlib; imprescindible para diagnosticar en segundo plano |
+
+### Módulos y prueba aislada
+
+1. **`src/bandeja.py`** — ícono con estados por color (esperando / escuchando / pensando /
+   hablando) y menú: pausar micrófono, ver estado, salir limpio.
+   - *Prueba:* `test_bandeja.py` — ícono solo, cambiando de estado con un timer falso,
+     sin el asistente detrás.
+2. **`src/registro.py`** — configuración de `logging` compartida; los `print()` informativos
+   de todos los módulos migran a `logger` (los tests siguen imprimiendo).
+   - *Prueba:* correr el asistente y verificar que `logs/asistente.log` registra turnos y errores.
+3. **`src/asistente.py`** (robustecer) — envolver el loop en recuperación por tipo de fallo:
+   sin internet → lo dice por voz y reintenta con espera creciente; micrófono desconectado →
+   reintenta y avisa en la bandeja; error inesperado → se registra y el loop continúa.
+   El TTS/STT locales nunca dependen de la red, así que el asistente siempre puede *avisar* qué pasa.
+   - *Prueba:* `test_resiliencia.py` + prueba manual: cortar el WiFi a mitad de conversación,
+     desenchufar el micrófono USB → el proceso no muere y se recupera al volver.
+4. **`scripts/instalar_autoarranque.ps1`** — crea la tarea programada apuntando a
+   `venv\Scripts\pythonw.exe src\asistente.py` con directorio de trabajo en la raíz
+   (crítico: rutas relativas a `models/` y `.env`). Incluir también el script inverso
+   (`desinstalar_autoarranque.ps1`).
+   - *Prueba:* cerrar sesión / reiniciar → el ícono aparece solo y el asistente responde.
+
+### Criterio de cierre
+
+Sobrevive un día completo de uso normal: arranca con Windows, sin consola, estados visibles
+en la bandeja, se recupera de cortes de red/micrófono, y se cierra limpio desde el menú.
+
+## Orden y dependencias
+
+```
+Fase A (v2: manos libres)  →  Fase B (v3: herramientas)  →  Fase C (v4: segundo plano)
+```
+
+- A va primero: es la base de la experiencia y lo que la Fase C deja corriendo todo el día.
+- B no depende de A técnicamente, pero probar herramientas por voz manos libres es el flujo real.
+- C va al final: solo tiene sentido dejar en segundo plano algo que ya hace cosas útiles.
+
+## Verificación global (al final de las 3 fases)
+
+Sin tocar el teclado, con la PC recién encendida: "Hey Jarvis, pon un temporizador de diez
+minutos y dime cuánta batería queda" → confirma por voz, el timer avisa hablando a los diez
+minutos, y el ícono de la bandeja reflejó cada estado. Ese es el asistente completo.
