@@ -35,22 +35,28 @@ las decisiones tomadas con su porqué. Actualízalo cuando se tomen decisiones n
 - Pruebas por capa: `src\test_capa1.py` (audio), `test_capa2.py` (STT), `test_capa3.py`
   (chat LLM), `test_capa4.py` / `test_voces_mujer.py` (voces TTS), `test_despertador.py`
   (wake word), `test_vad.py` (corte automático de fin de frase), `test_herramientas.py`
-  (herramientas sin LLM ni voz), `test_capa3b.py` (chat con function calling, sin audio).
+  (herramientas sin LLM ni voz), `test_capa3b.py` (chat con function calling, sin audio),
+  `test_stt_modelos.py` (benchmark de modelos Whisper con voz real, con/sin vocabulario).
 - Ejecutar siempre desde la raíz del proyecto.
 
 ## Arquitectura (src/)
 
 - `audio.py` — captura/reproducción, 16kHz mono float32, push-to-talk
-- `stt.py` — Whisper `small`, CPU int8, modelos en `models/`
+- `stt.py` — Whisper `small`, CPU int8, modelos en `models/`; hotwords desde
+  `vocabulario.txt` (raíz del proyecto, editable por el usuario) para nombres propios,
+  `condition_on_previous_text=False` y filtro de confianza contra alucinaciones
 - `llm.py` — NIM vía SDK openai; modelo `qwen/qwen3-next-80b-a3b-instruct`; key en `.env`
-  (`NVIDIA_API_KEY`); system prompt exige respuestas breves SIN markdown (se leen en voz alta).
+  (`NVIDIA_API_KEY`); system prompt exige respuestas breves SIN markdown (se leen en voz
+  alta) y avisa que la entrada viene del STT y puede traer errores fonéticos (interpretar
+  intención, no literal).
   Fase B: manda `tools=TOOLS` (schemas de `herramientas.py`) y maneja `tool_calls` en un
   bucle de hasta `MAX_LLAMADAS_HERRAMIENTAS = 3`; guarda por turno para no repetir
   herramientas "de apertura" y parser de respaldo para `tool_calls` que el modelo a veces
   escribe como texto plano en vez de usar el campo estructurado (ver Gotchas).
 - `herramientas.py` — Fase B: registro central `HERRAMIENTAS` (nombre → función + schema
   JSON) y despachador `ejecutar_herramienta()`. 4 grupos: apps/webs (`abrir_app`,
-  `abrir_web`, `buscar_en_google`, `reproducir_video_youtube` vía `yt-dlp`), búsqueda e
+  `abrir_web` — con varias palabras deriva a Google en vez de inventar un dominio `.com`,
+  `buscar_en_google`, `reproducir_video_youtube` y `abrir_canal_youtube` vía `yt-dlp`), búsqueda e
   info (`obtener_clima` con Open-Meteo, `buscar_info` con `ddgs`), sistema
   (`subir_bajar_volumen`/`silenciar_volumen` con `pycaw`, `control_multimedia` con
   `keyboard`, `estado_sistema` con `psutil`, `apagar_o_suspender_pc` con confirmación
@@ -88,7 +94,10 @@ las decisiones tomadas con su porqué. Actualízalo cuando se tomen decisiones n
 - `ddgs` es el nombre actual del paquete (antes `duckduckgo-search`, deprecado). Para
   video específico de YouTube no sirve `ddgs.videos()` (backends genéricos, no garantiza
   YouTube) ni `youtube-search-python` (sin mantenimiento desde 2020): se usa `yt-dlp` con
-  `extract_flat=True` y prefijo `ytsearch1:<consulta>` (solo trae metadata, no descarga).
+  `extract_flat=True` y prefijo `ytsearch5:<consulta>` (solo trae metadata, no descarga).
+  OJO: la búsqueda de YouTube mezcla videos con canales/playlists y al buscar un artista
+  famoso su canal oficial suele salir PRIMERO (ej: "duki" → `youtube.com/channel/...`);
+  por eso se piden 5 resultados y se abre el primero cuya URL contenga `watch?v=`.
 - Qwen3 (vía NIM) en el flujo de function calling: (1) a veces llama la misma herramienta
   "de apertura" dos veces en el mismo turno si no le convence el primer resultado (abre
   dos pestañas/apps reales) — mitigado con una guarda por turno en `llm.py`

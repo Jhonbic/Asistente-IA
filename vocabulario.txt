@@ -1,0 +1,19 @@
+# Vocabulario personalizado para el reconocimiento de voz (STT).
+#
+# Una palabra o nombre por línea. Cuando notes que el asistente entiende mal
+# un nombre (artista, app, lugar...), agrégalo aquí y reinicia el asistente.
+# Las líneas que empiezan con # son comentarios y se ignoran.
+
+# Artistas / música
+Duki
+Bizarrap
+Quevedo
+Milo J
+Saigo
+Alcoholyricos
+
+# Apps y servicios
+Spotify
+WhatsApp
+YouTube
+Chrome

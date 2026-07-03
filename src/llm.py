@@ -35,6 +35,10 @@ PROMPT_SISTEMA = """Eres un asistente de voz personal que corre en la PC de tu u
 Hablas español de forma natural, comica y cercana.
 
 Reglas importantes:
+- Lo que te llega del usuario viene de un reconocedor de voz y puede traer errores
+  fonéticos: palabras pegadas ("ponduki" = "pon Duki") o cambiadas por otras que suenan
+  parecido ("ahora es Spotify" = "abre Spotify"). Interpretá la intención más probable
+  en vez de tomarlo literal, sobre todo con nombres de artistas, canciones y apps.
 - Tus respuestas se convierten a voz: sé breve (1-3 frases salvo que pidan detalle).
 - Nada de markdown, listas, asteriscos ni emojis: solo texto plano hablable.
 - Escribe los números como palabras cuando sea natural decirlos así.
@@ -69,6 +73,7 @@ HERRAMIENTAS_NO_REPETIBLES_POR_TURNO = {
     "abrir_web",
     "buscar_en_google",
     "reproducir_video_youtube",
+    "abrir_canal_youtube",
 }
 
 # Qwen3 a veces, en vez de usar el campo estructurado tool_calls de la API,

@@ -442,6 +442,59 @@ normal ("¿cómo estás?") sigue respondiendo sin invocar herramientas innecesar
   siguientes. **FASE B (v3) COMPLETADA** — los 4 grupos de herramientas funcionan por
   voz end-to-end, con confirmación en acciones destructivas y timers avisando incluso
   fuera de turno. Próxima fase (no empezar sin que se pida): Fase C (v4, segundo plano).
+- 2026-07-02: Mejora de precisión del STT (pulido pre-Fase C, pedido por el usuario: "pon
+  Duki" se transcribía "pon duque"). Cambios en `src/stt.py`:
+  (1) **hotwords desde `vocabulario.txt`** (raíz del proyecto, una palabra por línea, `#`
+  comenta, editable por el usuario): sesga la decodificación hacia nombres propios
+  frecuentes sin inventarlos. OJO: en faster-whisper `hotwords` se ignora si se pasa
+  `initial_prompt`, por eso se usa solo `hotwords`. Si el archivo no existe o está vacío,
+  todo funciona como antes (`hotwords=None`).
+  (2) **`condition_on_previous_text=False`**: cada segmento se decodifica sin usar el
+  texto del anterior como contexto; evita que un error temprano contamine el resto
+  (las frases del asistente duran <15s, ese contexto no aporta).
+  (3) **Filtro de confianza por segmento**: se descartan segmentos con
+  `no_speech_prob > 0.6` **y** `avg_logprob < -1.0` a la vez (umbral conservador contra
+  alucinaciones típicas de Whisper tipo "Gracias por ver el video").
+  Además, nuevo `src/test_stt_modelos.py`: benchmark interactivo que graba frases reales
+  con el VAD (las guarda en `pruebas/` para re-comparar sin regrabar) y las transcribe
+  con `small`, `medium` y `large-v3-turbo`, con y sin vocabulario, midiendo tiempos —
+  el usuario decide con esa tabla si cambia el modelo por defecto (decisión del usuario:
+  medir antes de pagar latencia). `medium` (~1.5GB) y `large-v3-turbo` (~1.6GB) se
+  descargan a `models/` la primera vez.
+- 2026-07-02: Benchmark corrido con el micrófono real (4 frases). Tiempos promedio por
+  frase en esta CPU (int8): `small` 2.0s, `medium` 5.7s, `large-v3-turbo` 8.8s (turbo es
+  MÁS lento que medium en CPU: su encoder grande domina el costo). Precisión: `turbo`
+  perfecto en las 4; `small` solo falló "abre Spotify" → "ahora es Spotify"; `medium` no
+  fue claramente mejor que small ("Bonduki", "Visa Rap"). Con el vocabulario, `small` ya
+  no destroza nombres propios ("duque" desapareció; queda "ponduki" pegado, que el LLM
+  interpreta bien). **Decisión del usuario: quedarse con `small`** (2s vs 9s por turno) y
+  compensar su debilidad por el lado del LLM: se agregó al `PROMPT_SISTEMA` de `llm.py`
+  que la entrada viene de un reconocedor de voz y puede traer errores fonéticos, con
+  ejemplos ("ponduki" = "pon Duki", "ahora es Spotify" = "abre Spotify"), para que
+  interprete la intención en vez de tomarlo literal. `asistente.py` no se tocó (sigue
+  `Transcriptor("small")`). Los modelos medium/turbo quedan descargados en `models/` por
+  si se quiere re-comparar (se pueden borrar para liberar ~3GB).
+- 2026-07-02: Bug de `reproducir_video_youtube` (reportado por el usuario: "pon una
+  canción de Duki" a veces abría el canal `youtube.com/channel/UCJUYcEdvnYFGajHBW0Nao3w`
+  en vez de un video). Causa raíz, reproducida en consola: la búsqueda de YouTube mezcla
+  videos con canales/playlists, y con consultas cortas de artistas famosos
+  (`ytsearch:duki`) el canal oficial sale PRIMERO; el código abría `entradas[0]` sin
+  verificar el tipo. Arreglo en `herramientas.py`: se pide `ytsearch5:` en vez de
+  `ytsearch1:` y se abre el primer resultado cuya URL contenga `watch?v=` (los canales
+  son `/channel/...` y las playlists `playlist?list=...`, se saltean). Verificado:
+  "duki" ahora abre un video, no el canal. Costo extra de pedir 5 resultados flat:
+  despreciable (misma petición de búsqueda).
+- 2026-07-02: Al probar "abrí el canal de Duki", el LLM improvisó con
+  `abrir_web("youtube channel duki")` y la rama "mejor esfuerzo" inventó el dominio
+  `https://youtubechannelduki.com` (pegaba palabras + `.com`). Dos arreglos en
+  `herramientas.py`: (1) `abrir_web` con varias palabras ya no inventa dominios,
+  deriva a `buscar_en_google()`; (2) nueva herramienta `abrir_canal_youtube(nombre)` —
+  misma búsqueda `ytsearch5:` que los videos pero quedándose con el resultado que ES
+  canal (`/channel/` o `/@`); si no hay canal entre los resultados, abre la búsqueda de
+  YouTube. Ojo: buscar el nombre A SECAS (agregar "canal" a la consulta empeora los
+  resultados; YouTube ya pone el canal oficial primero). Agregada también a
+  `HERRAMIENTAS_NO_REPETIBLES_POR_TURNO` en `llm.py` (abre una pestaña real).
+  Verificado sin navegador: "duki" y "bizarrap" abren sus canales oficiales.
 
 ## Fase C — Siempre en segundo plano (v4)
 

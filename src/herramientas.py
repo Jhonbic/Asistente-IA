@@ -69,9 +69,14 @@ def abrir_web(sitio: str) -> str:
         url = sitio
     elif sitio_normalizado in WEBS_CONOCIDAS:
         url = WEBS_CONOCIDAS[sitio_normalizado]
-    else:
+    elif " " not in sitio_normalizado:
         # Mejor esfuerzo: asumimos que es un dominio ".com" válido.
-        url = f"https://{sitio_normalizado.replace(' ', '')}.com"
+        url = f"https://{sitio_normalizado}.com"
+    else:
+        # Varias palabras ("youtube channel duki") no son un dominio: pegarlas
+        # y agregar .com inventa una URL que no existe (o peor, abre la web de
+        # un desconocido). Mejor derivarlo a una búsqueda en Google.
+        return buscar_en_google(sitio)
 
     try:
         webbrowser.open(url)
@@ -102,18 +107,56 @@ def reproducir_video_youtube(consulta: str) -> str:
     opciones = {"quiet": True, "extract_flat": True, "noplaylist": True}
     try:
         with YoutubeDL(opciones) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{consulta}", download=False)
+            # ytsearch5 (no 1): la búsqueda de YouTube mezcla videos con canales
+            # y playlists, y al buscar un artista famoso su canal oficial suele
+            # salir PRIMERO (ej: "duki" → youtube.com/channel/...). Pedimos
+            # varios resultados y abrimos el primero que sea un video de verdad.
+            info = ydl.extract_info(f"ytsearch5:{consulta}", download=False)
         entradas = info.get("entries") or []
-        if not entradas:
-            return f"No encontré ningún video de '{consulta}' en YouTube."
 
-        primero = entradas[0]
-        url = primero.get("url") or primero.get("webpage_url")
-        titulo = primero.get("title", consulta)
-        webbrowser.open(url)
-        return f"Reproduciendo '{titulo}' en YouTube."
+        for entrada in entradas:
+            url = entrada.get("url") or entrada.get("webpage_url") or ""
+            if "watch?v=" not in url:  # canal o playlist: lo salteamos
+                continue
+            titulo = entrada.get("title", consulta)
+            webbrowser.open(url)
+            return f"Reproduciendo '{titulo}' en YouTube."
+
+        return f"No encontré ningún video de '{consulta}' en YouTube."
     except Exception as error:
         return f"No pude reproducir '{consulta}' en YouTube: {error}"
+
+
+def abrir_canal_youtube(nombre: str) -> str:
+    """Busca el canal de YouTube de un artista/creador y lo abre.
+
+    Misma búsqueda que reproducir_video_youtube, pero al revés: acá nos
+    quedamos con el resultado que ES un canal (URL /channel/ o /@usuario)
+    y salteamos los videos.
+    """
+    opciones = {"quiet": True, "extract_flat": True, "noplaylist": True}
+    try:
+        with YoutubeDL(opciones) as ydl:
+            # El nombre a secas: YouTube ya pone el canal oficial primero al
+            # buscar un artista conocido (agregar "canal" a la consulta lo empeora).
+            info = ydl.extract_info(f"ytsearch5:{nombre}", download=False)
+        entradas = info.get("entries") or []
+
+        for entrada in entradas:
+            url = entrada.get("url") or entrada.get("webpage_url") or ""
+            if "/channel/" in url or "/@" in url:
+                titulo = entrada.get("title") or entrada.get("channel") or nombre
+                webbrowser.open(url)
+                return f"Abriendo el canal '{titulo}' en YouTube."
+
+        # Sin canal entre los resultados: abrimos la búsqueda de YouTube para
+        # que el usuario elija (mejor que no hacer nada o inventar una URL).
+        from urllib.parse import quote_plus
+
+        webbrowser.open(f"https://www.youtube.com/results?search_query={quote_plus(nombre)}")
+        return f"No encontré el canal exacto de '{nombre}'; abrí la búsqueda en YouTube."
+    except Exception as error:
+        return f"No pude abrir el canal de '{nombre}': {error}"
 
 
 # Traduce los códigos WMO que devuelve Open-Meteo a una descripción hablable
@@ -448,6 +491,31 @@ HERRAMIENTAS = {
                         },
                     },
                     "required": ["consulta"],
+                },
+            },
+        },
+    },
+    "abrir_canal_youtube": {
+        "funcion": abrir_canal_youtube,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "abrir_canal_youtube",
+                "description": (
+                    "Busca el canal de YouTube de un artista, banda o creador y lo abre "
+                    "en el navegador. Usar cuando el usuario pida abrir o ver el CANAL "
+                    "de alguien en YouTube (no un video o canción concreta: para eso "
+                    "está reproducir_video_youtube)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "nombre": {
+                            "type": "string",
+                            "description": "Nombre del artista o creador cuyo canal abrir.",
+                        },
+                    },
+                    "required": ["nombre"],
                 },
             },
         },
