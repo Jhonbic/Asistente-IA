@@ -29,7 +29,7 @@ import numpy as np
 
 import audio
 from despertador import Despertador
-from herramientas import obtener_avisos_pendientes
+from herramientas import obtener_avisos_pendientes, precargar_catalogo_apps
 from llm import Cerebro
 from stt import Transcriptor
 from tts import Voz
@@ -39,7 +39,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 # Si el usuario dice alguna de estas palabras (sola o dentro de una frase
 # corta), el asistente se despide y termina.
-PALABRAS_SALIDA = ("adiós", "adios", "termina", "hasta luego", "chau", "chao")
+PALABRAS_SALIDA = ("adiós", "adios", "termina", "hasta luego", "chau", "chao", "desactivate")
 
 
 def es_despedida(texto: str) -> bool:
@@ -171,6 +171,10 @@ def main() -> None:
     # Cargamos todo UNA vez al inicio (los modelos tardan unos segundos en
     # cargar; hacerlo en cada turno sería un desperdicio).
     print("Iniciando asistente...")
+    # El catálogo de apps instaladas (Get-StartApps) tarda ~1-2 segundos:
+    # se lee en un hilo aparte mientras cargan Whisper y Piper, así el
+    # primer "abrí X" ya lo encuentra listo.
+    precargar_catalogo_apps()
     transcriptor = Transcriptor("small")
     cerebro = Cerebro()
     voz = Voz()  # es_AR-daniela-high

@@ -11,6 +11,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 import time
 
+import herramientas
 from herramientas import (
     abrir_app,
     abrir_web,
@@ -18,6 +19,7 @@ from herramientas import (
     buscar_en_google,
     buscar_info,
     cancelar_timer,
+    cerrar_app,
     control_multimedia,
     ejecutar_herramienta,
     estado_sistema,
@@ -30,8 +32,47 @@ from herramientas import (
     subir_bajar_volumen,
 )
 
-print("=== Prueba: abrir_app (bloc de notas) ===")
+# --- Catálogo dinámico de apps (no abre nada, solo busca) ----------------
+
+print("=== Prueba: catálogo de apps instaladas (Get-StartApps) ===")
+catalogo = herramientas._obtener_catalogo_apps()
+print(f"El catálogo tiene {len(catalogo)} apps.")
+assert len(catalogo) > 0, "El catálogo vino vacío: ¿falló PowerShell/Get-StartApps?"
+
+print("\n=== Prueba: búsqueda en el catálogo (exacta y difusa) ===")
+# Apps que sabemos que están instaladas en esta PC. La búsqueda difusa debe
+# encontrarlas aunque el nombre venga incompleto o con errores del STT.
+for pedido in ("whatsapp", "red dead", "red det redemption", "calculadora"):
+    resultado = herramientas._buscar_en_catalogo(pedido)
+    print(f"  '{pedido}' -> {resultado}")
+    assert resultado is not None, f"No se encontró '{pedido}' en el catálogo"
+
+print("\n=== Prueba: búsqueda de app inexistente (debe dar None, sin excepción) ===")
+resultado = herramientas._buscar_en_catalogo("aplicacionquenoexisteasdf")
+print(f"  resultado: {resultado}")
+assert resultado is None
+
+print("\n=== Prueba: abrir_app con app inexistente (mensaje de error, sin abrir nada) ===")
+print(abrir_app("aplicacionquenoexisteasdf"))
+
+print("\n=== Prueba: ventanas abiertas (no cierra nada, solo lista) ===")
+ventanas = herramientas._ventanas_abiertas()
+print(f"Hay {len(ventanas)} ventanas abiertas.")
+assert len(ventanas) > 0, "No se listó ninguna ventana: ¿falló PowerShell/Get-Process?"
+assert all("Name" in v and "MainWindowTitle" in v and "Id" in v for v in ventanas)
+
+print("\n=== Prueba: cerrar_app con app no abierta (mensaje de error, sin cerrar nada) ===")
+print(cerrar_app("appquenoexisteasdf"))
+
+print("\n--- Las siguientes pruebas SÍ abren apps/ventanas de verdad ---")
+
+print("\n=== Prueba: abrir_app (bloc de notas) ===")
 print(abrir_app("bloc de notas"))
+
+input("Presiona Enter cuando veas el bloc de notas abierto (lo vamos a cerrar)...")
+
+print("\n=== Prueba: cerrar_app (bloc de notas recién abierto) ===")
+print(cerrar_app("bloc de notas"))
 
 input("Presiona Enter para continuar...")
 

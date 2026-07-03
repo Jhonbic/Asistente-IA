@@ -43,10 +43,12 @@ Reglas importantes:
 - Nada de markdown, listas, asteriscos ni emojis: solo texto plano hablable.
 - Escribe los números como palabras cuando sea natural decirlos así.
 - Si no sabes algo, dilo honestamente y en corto.
-- Tenés herramientas para hacer cosas en la PC (abrir apps/webs, buscar información,
-  dar el clima, controlar volumen y multimedia, ver batería/CPU/RAM, poner timers,
-  apagar o suspender la PC). Cuando el pedido del usuario coincida con una, usala en vez
-  de solo describir cómo hacerlo. Anunciá brevemente la acción que vas a hacer.
+- Tenés herramientas para hacer cosas en la PC (abrir/cerrar apps, abrir webs, buscar
+  información, dar el clima, controlar volumen y multimedia, ver batería/CPU/RAM, poner
+  timers, apagar o suspender la PC). Cuando el pedido del usuario coincida con una, usala
+  en vez de solo describir cómo hacerlo. Anunciá brevemente la acción que vas a hacer.
+- NUNCA digas que estás haciendo una acción ("abro tal app") sin llamar a la herramienta
+  en ese mismo mensaje: decirlo sin llamarla deja al usuario esperando algo que no pasa.
 - Apagar o suspender la PC es una acción DESTRUCTIVA: primero preguntale al usuario si
   está seguro y llamá la herramienta con confirmar=false; solo volvé a llamarla con
   confirmar=true si el usuario confirmó explícitamente que sí en su siguiente mensaje."""
@@ -70,6 +72,7 @@ TOOLS = [entrada["schema"] for entrada in HERRAMIENTAS.values()]
 # Estas no deben ejecutarse dos veces en el mismo turno.
 HERRAMIENTAS_NO_REPETIBLES_POR_TURNO = {
     "abrir_app",
+    "cerrar_app",
     "abrir_web",
     "buscar_en_google",
     "reproducir_video_youtube",
@@ -82,6 +85,30 @@ HERRAMIENTAS_NO_REPETIBLES_POR_TURNO = {
 # crudo terminaría hablado por el TTS. Este patrón lo reconoce y permite
 # tratarlo como una llamada real.
 PATRON_TOOL_CALL_EN_TEXTO = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+# Tercer capricho de Qwen3 (descubierto 2026-07-03): a veces ANUNCIA la acción
+# ("Abro WhatsApp.") como respuesta final pero no emite ningún tool_call — el
+# usuario escucha que la va a hacer y no pasa nada. Peor: esa respuesta queda
+# en el historial y los turnos siguientes la imitan, así que la sesión entera
+# deja de usar herramientas. Este patrón detecta esos anuncios para reintentar
+# la petición UNA vez forzando una herramienta (tool_choice="required").
+PATRON_ANUNCIO_SIN_ACCION = re.compile(
+    r"\b(abro|abriendo|voy a abrir|cierro|cerrando|voy a cerrar|"
+    r"pongo|poniendo|voy a poner|reproduzco|reproduciendo|voy a reproducir|"
+    r"busco|buscando|voy a buscar|silencio el|subo el|bajo el)\b",
+    re.IGNORECASE,
+)
+
+
+def _parece_anuncio_sin_accion(texto: str) -> bool:
+    """True si el texto anuncia una acción concreta (y no es una pregunta).
+
+    Las preguntas se excluyen a propósito: si el modelo pregunta "¿Querés que
+    abra X?" está pidiendo confirmación y NO hay que forzar ninguna acción.
+    """
+    if not texto or "?" in texto or "¿" in texto:
+        return False
+    return PATRON_ANUNCIO_SIN_ACCION.search(texto) is not None
 
 
 def _extraer_tool_call_de_texto(texto: str):
@@ -136,6 +163,9 @@ class Cerebro:
         # este turno, para no repetirlas si el modelo insiste (ver
         # HERRAMIENTAS_NO_REPETIBLES_POR_TURNO más arriba).
         ejecutadas_este_turno: set[str] = set()
+        # Para reintentar con tool_choice="required" a lo sumo UNA vez por
+        # turno si el modelo anuncia una acción sin llamar la herramienta.
+        ya_forzado_este_turno = False
 
         for _ in range(MAX_LLAMADAS_HERRAMIENTAS):
             mensajes = [{"role": "system", "content": PROMPT_SISTEMA}] + self.historial
@@ -150,26 +180,46 @@ class Cerebro:
                 extraida = _extraer_tool_call_de_texto(mensaje.content)
                 if extraida is None:
                     texto = (mensaje.content or "").strip()
-                    self.historial.append({"role": "assistant", "content": texto})
-                    return texto
-                nombre, argumentos = extraida
-                id_falso = f"texto-plano-{len(self.historial)}"
-                self.historial.append(
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            {
-                                "id": id_falso,
-                                "type": "function",
-                                "function": {"name": nombre, "arguments": json.dumps(argumentos)},
-                            }
-                        ],
-                    }
-                )
-                resultado = self._ejecutar_con_guarda(nombre, argumentos, ejecutadas_este_turno)
-                self.historial.append({"role": "tool", "tool_call_id": id_falso, "content": resultado})
-                continue
+                    # Anuncio sin acción ("Abro WhatsApp." y ningún tool_call):
+                    # reintentamos una vez FORZANDO que llame una herramienta.
+                    # Solo si todavía no ejecutó ninguna en este turno: después
+                    # de una herramienta real, un "Abriendo X." de cierre es la
+                    # respuesta correcta, no un anuncio vacío.
+                    if (
+                        not ya_forzado_este_turno
+                        and not ejecutadas_este_turno
+                        and _parece_anuncio_sin_accion(texto)
+                    ):
+                        ya_forzado_este_turno = True
+                        mensaje = self._pedir_completado(mensajes, forzar_herramienta=True)
+                        tool_calls = mensaje.tool_calls
+                    if not tool_calls:
+                        # Sin reintento (o el reintento tampoco trajo llamadas):
+                        # es una respuesta de texto normal, la devolvemos.
+                        self.historial.append({"role": "assistant", "content": texto})
+                        return texto
+                    # El reintento forzado SÍ trajo tool_calls: seguimos abajo
+                    # por el camino estructurado normal (sin guardar el anuncio
+                    # vacío en el historial, para que no lo imite después).
+                else:
+                    nombre, argumentos = extraida
+                    id_falso = f"texto-plano-{len(self.historial)}"
+                    self.historial.append(
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": id_falso,
+                                    "type": "function",
+                                    "function": {"name": nombre, "arguments": json.dumps(argumentos)},
+                                }
+                            ],
+                        }
+                    )
+                    resultado = self._ejecutar_con_guarda(nombre, argumentos, ejecutadas_este_turno)
+                    self.historial.append({"role": "tool", "tool_call_id": id_falso, "content": resultado})
+                    continue
 
             # El modelo pidió usar una o más herramientas: las ejecutamos y le
             # devolvemos el resultado para que arme la respuesta final.
@@ -207,8 +257,18 @@ class Cerebro:
         ejecutadas_este_turno.add(nombre)
         return ejecutar_herramienta(nombre, argumentos)
 
-    def _pedir_completado(self, mensajes: list[dict], permitir_herramientas: bool = True):
-        """Llama a la API con reintento ante rate limit; devuelve el mensaje de la respuesta."""
+    def _pedir_completado(
+        self,
+        mensajes: list[dict],
+        permitir_herramientas: bool = True,
+        forzar_herramienta: bool = False,
+    ):
+        """Llama a la API con reintento ante rate limit; devuelve el mensaje de la respuesta.
+
+        Con forzar_herramienta=True se manda tool_choice="required": el modelo
+        está OBLIGADO a llamar alguna herramienta (se usa para el reintento
+        cuando anunció una acción sin ejecutarla).
+        """
         kwargs = dict(
             model=self.modelo,
             messages=mensajes,
@@ -217,7 +277,7 @@ class Cerebro:
         )
         if permitir_herramientas:
             kwargs["tools"] = TOOLS
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = "required" if forzar_herramienta else "auto"
 
         try:
             respuesta = self.client.chat.completions.create(**kwargs)
